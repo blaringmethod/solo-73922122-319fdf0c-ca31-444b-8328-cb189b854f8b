@@ -12,9 +12,9 @@ header{display:flex;align-items:center;gap:14px;flex-wrap:wrap;padding:14px 22px
 h1{font-size:18px;margin:0}
 .badge{padding:3px 12px;border-radius:999px;font-weight:600;font-size:12px;border:1px solid var(--line)}
 .b-IDLE{background:#1f2937;color:#9ca3af}
-.b-PREPARING,.b-RECOVERING,.b-VERIFYING{background:#3b2f0b;color:var(--warn)}
+.b-PREPARING,.b-RECOVERING,.b-VERIFYING,.b-RECLAIMING{background:#3b2f0b;color:var(--warn)}
 .b-READY{background:#052e1b;color:var(--ok)}
-.b-FAILED{background:#3b0d0d;color:var(--bad)}
+.b-FAILED,.b-RECLAIM_FAILED{background:#3b0d0d;color:var(--bad)}
 main{max-width:1180px;margin:0 auto;padding:18px;display:grid;gap:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:16px 18px}
 .card h2{margin:0 0 10px;font-size:15px;color:#aec2ff}
@@ -42,13 +42,22 @@ pre{white-space:pre-wrap;word-break:break-all;background:#0a0e18;border:1px soli
 select,input[type=number]{background:#0a0e18;color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:6px 8px}
 label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--warn);font-size:13px}
 .errbox{background:#3b0d0d;border:1px solid #7f1d1d;border-radius:8px;padding:10px 12px;margin:6px 0}
+.faultbox{background:#1a1508;border:1px solid #78571a;border-radius:8px;padding:10px 12px;margin:10px 0}
+.faultbox label{display:flex;gap:8px;align-items:center;margin:4px 0;font-size:13px;color:var(--fg)}
+.evlist{background:#0a0e18;border:1px solid var(--line);border-radius:8px;padding:8px 10px;margin:6px 0;font-size:12px;color:#a9b8e8}
+.evlist table{margin:2px 0}
+.evlist th,.evlist td{padding:2px 6px;font-size:12px}
+.pill{display:inline-block;padding:1px 8px;border-radius:999px;font-size:11px;border:1px solid var(--line)}
+.pill.live{background:#052e1b;color:var(--ok)}
+.pill.dead{background:#1f2937;color:#9ca3af}
+.pill.unk{background:#3b2f0b;color:var(--warn)}
 </style>
 </head>
 <body>
 <header>
   <h1>🛰️ 遥测恢复演练台</h1>
   <span id="stateBadge" class="badge b-IDLE">加载中…</span>
-  <span class="mut small">物理基线备份 + WAL 归档重放 · 精确停在命名恢复点 · 原库持续入仓不受影响</span>
+  <span class="mut small">物理基线备份 + WAL 归档重放 · 精确停在命名恢复点 · 原库持续入仓不受影响 · 回收先确认停库再删副本</span>
 </header>
 <main>
   <div class="grid2">
@@ -63,8 +72,16 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
       <div id="rpList"></div>
       <label class="chk" id="faultWrap" style="display:none">
         <input type="checkbox" id="injectFault"/>
-        <span>注入故障：模拟 WAL 归档缺段（段 <code id="missingSeg"></code> 将被“丢失”），用于演示“未到达目标恢复点”的失败路径</span>
+        <span>注入恢复故障：模拟 WAL 归档缺段（段 <code id="missingSeg"></code> 将被“丢失”），用于演示“未到达目标恢复点”的失败路径</span>
       </label>
+      <div class="faultbox">
+        <div class="small warn"><b>停库故障注入（可控演示回收安全）</b></div>
+        <div class="small mut" id="faultHint">改变下一次“回收/失败收尾”时 pg_ctl stop 的命令表现；实例是否真停始终由应用独立探测裁决。</div>
+        <label><input type="radio" name="stopMode" value="ok"/> <span>正常停库（默认）</span></label>
+        <label><input type="radio" name="stopMode" value="stop_error"/> <span>停库命令报错，且实例保持运行（旧实例还活着）</span></label>
+        <label><input type="radio" name="stopMode" value="stop_timeout"/> <span>停库命令超时挂起（实例保持运行）</span></label>
+        <label><input type="radio" name="stopMode" value="stop_error_dead"/> <span>停库命令报错，但实例实际已停（应仍能完成清理）</span></label>
+      </div>
       <div style="display:flex;gap:10px;align-items:center;margin-top:8px">
         <button id="startBtn" onclick="startRecovery()" disabled>启动恢复</button>
         <span class="small mut">全站同时只允许一份恢复；恢复实例为独立副本，原库不受影响</span>
@@ -74,6 +91,7 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
 
   <section class="card">
     <h2>③ 恢复进度</h2>
+    <div id="reclaimBanner" class="errbox hidden"></div>
     <div id="steps"></div>
     <div id="runMeta" class="small mut"></div>
     <div id="events"></div>
@@ -94,16 +112,20 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
     </div>
     <div id="rowsBody"></div>
     <div style="margin-top:12px">
-      <button class="danger" onclick="reclaim()">回收当前恢复库（停止实例并删除副本，之后可再次恢复）</button>
+      <button class="danger" id="reclaimReadyBtn" onclick="reclaim()">回收当前恢复库（先确认停库，再删除副本并释放名额）</button>
     </div>
   </section>
 
-  <section class="card hidden" id="failedCard">
-    <h2>④ 恢复失败</h2>
-    <div class="errbox" id="failedBody"></div>
-    <div class="small mut">恢复进程已停止并回收，失败残库不开放查询。必须回收残库后才允许重试。</div>
-    <div style="margin-top:10px">
-      <button class="danger" onclick="reclaim()">回收残库并重置（之后可重新发起恢复）</button>
+  <section class="card hidden" id="terminalCard">
+    <h2 id="terminalTitle">④ 恢复失败 / 回收处理</h2>
+    <div class="errbox" id="terminalBody"></div>
+    <div id="reclaimDetail"></div>
+    <div style="margin-top:10px;display:flex;gap:10px;align-items:center">
+      <button class="danger" id="reclaimRetryBtn" onclick="reclaim()">重试回收（再次独立确认停库后清理）</button>
+      <span id="reclaimBtnHint" class="small mut"></span>
+    </div>
+    <div class="small mut" style="margin-top:8px">
+      实例仍存活或无法确认停止时，副本目录与恢复名额会被保留，结果查询一律拒绝；只有确认停止并删除副本后才能再次发起恢复。
     </div>
   </section>
 </main>
@@ -111,14 +133,18 @@ label.chk{display:flex;gap:8px;align-items:flex-start;margin:10px 0;color:var(--
 <script>
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-const STATE_CN = {IDLE:'空闲',PREPARING:'准备中',RECOVERING:'WAL 重放中',VERIFYING:'校验目标中',READY:'已到达目标 · 结果开放',FAILED:'失败（进程已回收）'};
+const STATE_CN = {
+  IDLE:'空闲', PREPARING:'准备中', RECOVERING:'WAL 重放中', VERIFYING:'校验目标中',
+  READY:'已到达目标 · 结果开放', FAILED:'恢复失败（待回收）',
+  RECLAIMING:'停库回收中…', RECLAIM_FAILED:'回收未完成（实例未确认停止）'
+};
 const STEPS = [
   ['PREPARING','① 复制物理基线备份 / 写入恢复配置'],
   ['RECOVERING','② 启动恢复实例，从 WAL 归档重放'],
   ['VERIFYING','③ 校验是否准确停在目标恢复点'],
   ['READY','④ 确认到达目标，开放结果查询'],
 ];
-let manifest = null, curState = 'IDLE', filtersInit = false;
+let manifest = null, curState = 'IDLE', filtersInit = false, curStatus = null;
 
 async function api(path, opts){
   const r = await fetch(path, opts);
@@ -156,6 +182,19 @@ function renderPlan(){
   $('#startBtn').disabled = !idle;
 }
 
+async function loadFaultMode(){
+  try{
+    const f = await api('/api/fault');
+    document.querySelectorAll('input[name=stopMode]').forEach(el => {
+      el.checked = (el.value === f.stop_mode);
+      el.onchange = () => api('/api/fault', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({stop_mode: el.value})
+      }).catch(e => alert('故障模式切换失败：' + e.message));
+    });
+  }catch(e){ /* 状态页轮询会再试 */ }
+}
+
 async function pollPrimary(){
   try{
     const s = await api('/api/primary/stats');
@@ -175,16 +214,25 @@ async function pollPrimary(){
 async function pollStatus(){
   let s;
   try{ s = await api('/api/status'); }catch(e){ return; }
+  curStatus = s;
   curState = s.state;
   const badge = $('#stateBadge');
   badge.className = 'badge b-' + s.state;
   badge.textContent = STATE_CN[s.state] || s.state;
   renderPlan();
   renderProgress(s);
+  renderReclaimBanner(s);
   $('#resultCard').classList.toggle('hidden', s.state !== 'READY');
-  $('#failedCard').classList.toggle('hidden', s.state !== 'FAILED');
+  $('#terminalCard').classList.toggle('hidden', !(s.state === 'FAILED' || s.state === 'RECLAIM_FAILED' || s.state === 'RECLAIMING'));
   if(s.state === 'READY') await renderResult();
-  if(s.state === 'FAILED') renderFailed(s);
+  if(s.state === 'FAILED' || s.state === 'RECLAIM_FAILED' || s.state === 'RECLAIMING') renderTerminal(s);
+}
+
+function renderReclaimBanner(s){
+  const el = $('#reclaimBanner');
+  if(s.state !== 'RECLAIMING'){ el.classList.add('hidden'); el.innerHTML=''; return; }
+  el.classList.remove('hidden');
+  el.innerHTML = '<b class="warn">⏳ 正在停库并独立确认…</b><div class="small mut" style="margin-top:4px">状态页保持可用；确认实例停止前不会删除副本，清理完成前不允许发起新恢复。</div>';
 }
 
 function renderProgress(s){
@@ -192,7 +240,7 @@ function renderProgress(s){
   const cur = s.state === 'FAILED' ? (s.run && s.run.error ? failStage(s) : 0) : order.indexOf(s.state);
   $('#steps').innerHTML = s.run ? STEPS.map(([k,label],i) => {
     let cls = '', icon = '○';
-    if(s.state === 'FAILED' && i === cur){ cls = 'err'; icon = '✗'; }
+    if((s.state === 'FAILED' || s.state === 'RECLAIM_FAILED') && i === cur){ cls = 'err'; icon = '✗'; }
     else if(i < cur || s.state === 'READY'){ cls = 'done'; icon = '✓'; }
     else if(i === cur){ cls = 'on'; icon = '▶'; }
     return `<div class="step ${cls}">${icon} ${label}</div>`;
@@ -202,8 +250,9 @@ function renderProgress(s){
       `任务 <code>${esc(s.run.id)}</code> · 目标恢复点 <code>${esc(s.run.restore_point)}</code>` +
       (s.run.inject_fault ? ` · <span class="warn">已注入归档缺段（${esc(s.run.missing_segment)}）</span>` : '') +
       (s.run.replay_lsn ? ` · 已重放至 LSN <code>${esc(s.run.replay_lsn)}</code>（${esc(s.run.replay_ts || '')}）` : '') +
-      ` · 开始于 ${esc(s.run.started_at)}`;
-    $('#events').innerHTML = s.run.events.slice(-10).map(e =>
+      ` · 开始于 ${esc(s.run.started_at)}` +
+      ` · 停库故障模式 <span class="warn">${esc(s.stop_fault_mode || 'ok')}</span>`;
+    $('#events').innerHTML = s.run.events.slice(-12).map(e =>
       `<div class="small mut">[${esc(e.ts)}] ${esc(e.msg)}</div>`).join('');
   } else {
     $('#runMeta').textContent = ''; $('#events').textContent = '';
@@ -212,7 +261,6 @@ function renderProgress(s){
 }
 
 function failStage(s){
-  // 根据事件推断失败时所处阶段，用于步骤条红叉位置
   const msgs = (s.run.events || []).map(e => e.msg).join('');
   if(msgs.includes('校验') || msgs.includes('提升')) return 2;
   if(msgs.includes('重放') || msgs.includes('启动恢复实例')) return 1;
@@ -246,6 +294,7 @@ async function renderResult(){
     filtersInit = true;
     queryRows();
   }
+  $('#reclaimReadyBtn').disabled = (curStatus && curStatus.state === 'RECLAIMING');
 }
 
 function matrixTable(matrix){
@@ -263,7 +312,7 @@ async function queryRows(){
   try{
     const r = await api('/api/recovered/rows?' + q.toString());
     $('#rowsBody').innerHTML = r.rows.length === 0
-      ? '<div class="warn small">0 行 —— 该筛选条件下恢复库中无记录（若筛选的是误删集，说明此恢复点位于误删之后）</div>'
+      ? '<div class="warn small">0 行 —— 该筛选条件下无记录（若筛选的是误删集，说明此恢复点位于误删之后）</div>'
       : `<div class="small mut">返回 ${r.rows.length} 行</div>
         <table><tr><th>id</th><th>设备</th><th>站点</th><th>指标</th><th>值</th><th>recorded_at</th><th>ingested_at</th></tr>
         ${r.rows.map(x => `<tr><td>${x.id}</td><td>${esc(x.device_id)}</td><td>${esc(x.site)}</td><td>${esc(x.metric)}</td><td>${x.value}</td><td class="small">${esc(x.recorded_at)}</td><td class="small">${esc(x.ingested_at)}</td></tr>`).join('')}</table>`;
@@ -272,12 +321,64 @@ async function queryRows(){
   }
 }
 
-function renderFailed(s){
+function evidenceTable(ev){
+  if(!ev || !ev.length) return '';
+  const rows = ev.map(e => {
+    const pid = e.pid_process_alive === true ? '<span class="pill live">存活</span>'
+      : e.pid_process_alive === false ? '<span class="pill dead">已退出</span>'
+      : '<span class="pill unk">无/未知</span>';
+    const rc = (e.pg_ctl_status_rc === 0) ? '<span class="pill live">0 运行中</span>'
+      : (e.pg_ctl_status_rc == null ? '<span class="pill unk">未知</span>'
+      : `<span class="pill dead">${e.pg_ctl_status_rc} 未运行</span>`);
+    const port = e.port_listening === true ? '<span class="pill live">监听中</span>'
+      : e.port_listening === false ? '<span class="pill dead">无监听</span>'
+      : '<span class="pill unk">未知</span>';
+    return `<tr><td>第${esc(e.probe_round)}轮</td><td>${e.postmaster_pid==null?'—':esc(e.postmaster_pid)} ${pid}</td><td>${rc}</td><td>${port}</td><td>${esc(e.note||'')}</td></tr>`;
+  }).join('');
+  return `<div class="evlist"><table>
+    <tr><th>探测</th><th>postmaster.pid 进程</th><th>pg_ctl status</th><th>端口 ${RECOVERY_PORT_HINT}</th><th>备注</th></tr>
+    ${rows}</table></div>`;
+}
+const RECOVERY_PORT_HINT = '5433';
+
+function renderTerminal(s){
   const r = s.run || {};
-  $('#failedBody').innerHTML =
-    `<b>失败原因：</b>${esc(r.error || '未知')}<br/>` +
-    (r.inject_fault ? `<span class="warn small">本次注入了归档缺段故障（段 ${esc(r.missing_segment)} 缺失），失败符合预期。</span><br/>` : '') +
-    `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')}</span>`;
+  const busy = s.state === 'RECLAIMING';
+  $('#terminalTitle').textContent = s.state === 'RECLAIM_FAILED'
+    ? '④ 回收未完成（实例未确认停止，副本与名额保留）'
+    : (s.state === 'RECLAIMING' ? '④ 停库回收进行中' : '④ 恢复失败（残库待回收）');
+  let html = '';
+  if(r.error){
+    html += `<b>恢复失败原因：</b>${esc(r.error)}<br/>`;
+  }
+  if(r.reclaim_error){
+    html += `<b class="bad">未回收原因：</b><span class="bad">${esc(r.reclaim_error)}</span><br/>`;
+  }
+  if(r.reclaim_command_issue){
+    html += `<span class="warn small">停库命令问题：${esc(r.reclaim_command_issue)}</span><br/>`;
+  }
+  if(r.inject_fault){
+    html += `<span class="warn small">本次注入了归档缺段故障（段 ${esc(r.missing_segment)} 缺失）。</span><br/>`;
+  }
+  html += `<span class="small mut">任务 ${esc(r.id || '')} · 目标恢复点 ${esc(r.restore_point || '')} · 副本目录 <code>${esc(r.rundir || '')}</code></span>`;
+  $('#terminalBody').innerHTML = html;
+
+  let detail = '';
+  if(r.reclaim_evidence && r.reclaim_evidence.length){
+    detail += '<h2 style="margin-top:10px">实例存活独立探测证据（postmaster 进程 / pg_ctl status / 端口三路）</h2>'
+      + evidenceTable(r.reclaim_evidence);
+  }
+  detail += `<div class="small mut">磁盘遗留副本目录：${(s.leftover_dirs&&s.leftover_dirs.length)?esc(s.leftover_dirs.join(', ')):'无'} · 恢复端口占用：${s.recovery_port_in_use?'<span class="bad">是（实例仍监听）</span>':'否'} · 当前停库故障模式：<span class="warn">${esc(s.stop_fault_mode||'ok')}</span></div>`;
+  if(busy){
+    detail += '<div class="small warn" style="margin-top:6px">正在后台执行停库与多轮独立确认，本页面与只读接口保持可用…</div>';
+  } else if(s.state === 'RECLAIM_FAILED'){
+    detail += '<div class="small bad" style="margin-top:6px">未确认停止：目录未删除、恢复名额未释放、结果查询已拒绝。可将停库故障模式切回“正常停库”后点击“重试回收”。</div>';
+  } else if(s.state === 'FAILED'){
+    detail += '<div class="small mut" style="margin-top:6px">失败收尾已尝试停止确认；若实例仍存活会转入“回收未完成”。点击下方按钮回收残库并释放名额。</div>';
+  }
+  $('#reclaimDetail').innerHTML = detail;
+  $('#reclaimRetryBtn').disabled = busy;
+  $('#reclaimBtnHint').textContent = busy ? '回收进行中，请稍候…' : '';
 }
 
 async function startRecovery(){
@@ -290,23 +391,23 @@ async function startRecovery(){
     });
     filtersInit = false;
     pollStatus();
-  }catch(e){ alert('启动失败：' + e.message); }
+  }catch(e){ alert('启动被拒绝：' + e.message); }
 }
 
 async function reclaim(){
   try{
     await api('/api/reclaim', {method:'POST'});
-    filtersInit = false;
-    $('#rowsBody').innerHTML = '';
     pollStatus();
-  }catch(e){ alert('回收失败：' + e.message); }
+  }catch(e){ alert('回收请求失败：' + e.message); }
 }
 
 loadManifest();
+loadFaultMode();
 pollPrimary();
 pollStatus();
 setInterval(pollStatus, 1500);
 setInterval(pollPrimary, 3000);
+setInterval(loadFaultMode, 5000);
 </script>
 </body>
 </html>

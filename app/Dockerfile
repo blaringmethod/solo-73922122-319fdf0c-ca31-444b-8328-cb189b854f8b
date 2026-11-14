@@ -11,8 +11,9 @@ RUN pip3 install --no-cache-dir --break-system-packages -r requirements.txt
 
 COPY main.py .
 COPY restore_command.sh /opt/app/restore_command.sh
+COPY pg_ctl_wrapper.sh /opt/app/pg_ctl_wrapper.sh
 COPY static/ /opt/app/static/
-RUN chmod 755 /opt/app/restore_command.sh
+RUN chmod 755 /opt/app/restore_command.sh /opt/app/pg_ctl_wrapper.sh
 
 EXPOSE 8080
 CMD ["python3", "-m", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]

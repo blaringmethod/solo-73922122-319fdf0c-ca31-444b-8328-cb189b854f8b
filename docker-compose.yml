@@ -74,6 +74,11 @@ services:
       PRIMARY_DSN: host=primary port=5432 dbname=telemetry user=postgres password=postgres
       RECOVERY_PORT: "5433"        # 恢复实例仅监听容器内 127.0.0.1:5433，不对外暴露
       RECOVERY_TIMEOUT: "300"
+      # 停库安全参数：停库命令硬超时 / pg_ctl -w 等待 / 独立确认探测轮次与间隔
+      STOP_TIMEOUT: "15"
+      STOP_WAIT_SECONDS: "10"
+      STOP_CONFIRM_TRIES: "6"
+      STOP_CONFIRM_INTERVAL: "2"
       TZ: Asia/Shanghai            # 与原库一致，便于核对 recorded_at 显示
     ports:
       - "8080:8080"                # 浏览器入口 http://localhost:8080
